@@ -287,12 +287,114 @@ def find_card_scale(rgb: np.ndarray, thresh: int):
     gray = (0.299*rgb[...,0] + 0.587*rgb[...,1] + 0.114*rgb[...,2]).astype(np.uint8)
     return _largest_dark_rect(gray, thresh)
 
-def find_leaf_mask(rgb: np.ndarray, hsv_lo: list, hsv_hi: list) -> np.ndarray:
+
+# ─── Leaf mask helpers ────────────────────────────────────────────────────────
+
+def _gradient_edges(gray: np.ndarray, sigma: float = 1.5) -> np.ndarray:
+    """
+    Sobel-like gradient magnitude using scipy.  Returns a 0-255 uint8 edge map.
+    Falls back to simple numpy diff if scipy unavailable.
+    """
+    try:
+        from scipy.ndimage import gaussian_filter, sobel
+        blurred = gaussian_filter(gray.astype(np.float32), sigma=sigma)
+        gx = sobel(blurred, axis=1)
+        gy = sobel(blurred, axis=0)
+        mag = np.hypot(gx, gy)
+        mag = (mag / mag.max() * 255).astype(np.uint8) if mag.max() > 0 else mag.astype(np.uint8)
+        return mag
+    except ImportError:
+        gx = np.abs(np.diff(gray.astype(np.int16), axis=1, prepend=gray[:, :1]))
+        gy = np.abs(np.diff(gray.astype(np.int16), axis=0, prepend=gray[:1, :]))
+        mag = np.hypot(gx, gy).clip(0, 255).astype(np.uint8)
+        return mag
+
+def _flood_fill_holes(mask: np.ndarray) -> np.ndarray:
+    """
+    Fill internal holes in a boolean mask by flood-filling from every border pixel
+    that is False, then inverting: anything NOT reachable from the border = inside the leaf.
+    Works entirely with scipy label / numpy — no opencv needed.
+    """
+    try:
+        from scipy.ndimage import label as sp_label, binary_fill_holes
+        # binary_fill_holes directly fills holes inside each connected component
+        return binary_fill_holes(mask).astype(bool)
+    except ImportError:
+        return mask.astype(bool)
+
+def _contour_mask(gray: np.ndarray, seed_mask: np.ndarray,
+                  edge_thresh: int = 30, dilate_iters: int = 4) -> np.ndarray:
+    """
+    Grow a contour-based mask starting from `seed_mask` (the HSV hits).
+
+    Steps:
+      1. Compute gradient edge map of the grayscale image.
+      2. Build a 'barrier' from strong edges — these are the leaf boundaries.
+      3. Dilate the seed mask outward, stopping at barriers.
+      4. Flood-fill holes so white spots / venation gaps inside are included.
+      5. Return the union of the expanded mask + original seed.
+    """
+    try:
+        from scipy.ndimage import binary_dilation, binary_fill_holes, label as sp_label
+    except ImportError:
+        return _flood_fill_holes(seed_mask)
+
+    # ── Step 1-2: edge barrier ───────────────────────────────────────────
+    edges = _gradient_edges(gray)
+    barrier = edges > edge_thresh          # strong edges block expansion
+
+    # ── Step 3: iteratively dilate seed, blocked by barrier ─────────────
+    struct = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=bool)  # 4-connected
+    grown = seed_mask.copy().astype(bool)
+    for _ in range(dilate_iters):
+        expanded = binary_dilation(grown, structure=struct)
+        # Allow expansion only into non-barrier pixels
+        grown = expanded & ~barrier
+
+    # ── Step 4: fill internal holes (white spots, veins, pale patches) ──
+    filled = binary_fill_holes(grown).astype(bool)
+
+    # ── Step 5: union with original seed ────────────────────────────────
+    combined = filled | seed_mask.astype(bool)
+
+    # Keep only the largest blob to avoid merging distant noise
+    labeled, n = sp_label(combined)
+    if n == 0:
+        return seed_mask.astype(bool)
+    sizes = np.bincount(labeled.ravel()); sizes[0] = 0
+    combined = (labeled == sizes.argmax()).astype(bool)
+
+    return combined
+
+
+def find_leaf_mask(rgb: np.ndarray, hsv_lo: list, hsv_hi: list,
+                   use_contour: bool = True,
+                   edge_thresh: int = 30,
+                   contour_expand: int = 4) -> np.ndarray:
+    """
+    Hybrid leaf segmentation:
+      1. HSV colour mask  → reliable for clearly green areas
+      2. Contour / flood-fill expansion → fills white spots, pale edges, venation
+
+    `use_contour=False` gives pure HSV (fast, for species with clean colour).
+    `use_contour=True`  gives HSV + contour fill (for leaves with white spots / pale edges).
+    """
     hsv = _rgb_to_hsv(rgb)
     raw = _hsv_mask(hsv, hsv_lo, hsv_hi)
-    return _morph(raw, radius=7)
+    hsv_clean = _morph(raw, radius=7)
 
-def live_preview(img_bytes: bytes, hsv_lo: list, hsv_hi: list, card_thresh: int):
+    if not use_contour or not hsv_clean.any():
+        return hsv_clean
+
+    gray = (0.299*rgb[...,0] + 0.587*rgb[...,1] + 0.114*rgb[...,2]).astype(np.uint8)
+    return _contour_mask(gray, hsv_clean,
+                         edge_thresh=edge_thresh,
+                         dilate_iters=contour_expand)
+
+
+
+def live_preview(img_bytes: bytes, hsv_lo: list, hsv_hi: list, card_thresh: int,
+                 use_contour: bool = True, edge_thresh: int = 30, contour_expand: int = 4):
     """Returns (jpeg_bytes, card_found, leaf_found)."""
     rgb = _load_rgb(img_bytes)
 
@@ -308,8 +410,11 @@ def live_preview(img_bytes: bytes, hsv_lo: list, hsv_hi: list, card_thresh: int)
         card_region[cy:cy+ch, cx:cx+cw] = True
         canvas = _blend(canvas, card_region, (0, 210, 255), alpha=0.45)
 
-    # Leaf: lime fill
-    leaf_mask = find_leaf_mask(rgb, hsv_lo, hsv_hi)
+    # Leaf: lime fill (hybrid HSV + contour)
+    leaf_mask = find_leaf_mask(rgb, hsv_lo, hsv_hi,
+                               use_contour=use_contour,
+                               edge_thresh=edge_thresh,
+                               contour_expand=contour_expand)
     leaf_found = bool(leaf_mask.any())
     if leaf_found:
         canvas = _blend(canvas, leaf_mask, (50, 255, 80), alpha=0.45)
@@ -330,7 +435,9 @@ def live_preview(img_bytes: bytes, hsv_lo: list, hsv_hi: list, card_thresh: int)
     return _to_jpeg(np.array(pil), 90), card_found, leaf_found
 
 def process_image(img_bytes: bytes, card_size_cm: float,
-                  hsv_lo: list, hsv_hi: list, card_thresh: int) -> dict:
+                  hsv_lo: list, hsv_hi: list, card_thresh: int,
+                  use_contour: bool = True, edge_thresh: int = 30,
+                  contour_expand: int = 4) -> dict:
     rgb  = _load_rgb(img_bytes)
     gray = (0.299*rgb[...,0] + 0.587*rgb[...,1] + 0.114*rgb[...,2]).astype(np.uint8)
 
@@ -341,7 +448,10 @@ def process_image(img_bytes: bytes, card_size_cm: float,
     px_per_cm  = avg_side / card_size_cm
     px_per_cm2 = px_per_cm ** 2
 
-    leaf_mask = find_leaf_mask(rgb, hsv_lo, hsv_hi)
+    leaf_mask = find_leaf_mask(rgb, hsv_lo, hsv_hi,
+                               use_contour=use_contour,
+                               edge_thresh=edge_thresh,
+                               contour_expand=contour_expand)
     if not leaf_mask.any():
         return {"error": "Could not detect leaf. Adjust the HSV sliders for this species."}
 
@@ -485,7 +595,23 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="section-header">📄 Google Docs Export</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">🔲 Contour / Hole-Fill</div>', unsafe_allow_html=True)
+    use_contour = st.toggle("Enable contour expansion", value=True,
+                            help="Expands the HSV mask outward along leaf edges and fills "
+                                 "holes (white spots, veins, pale patches). "
+                                 "Turn off for clean solid-colour leaves.")
+    if use_contour:
+        edge_thresh = st.slider("Edge sensitivity", 10, 80, 30,
+                                help="Higher = only very sharp edges act as barriers. "
+                                     "Lower = gentler edges also block expansion.")
+        contour_expand = st.slider("Contour expansion (px)", 1, 20, 4,
+                                   help="How many pixels outward the contour grows "
+                                        "from the HSV seed before being stopped by edges.")
+    else:
+        edge_thresh    = 30
+        contour_expand = 4
+    st.caption("💡 **For white-spotted leaves** (e.g. Aralia): keep contour ON, "
+               "raise expansion to 8–12 px.")
     gdoc_id = st.text_input("Google Doc ID", placeholder="Paste doc ID from URL")
     sa_json = st.text_area("Service Account JSON", placeholder='{"type":"service_account",...}', height=100)
     st.caption("Share your Google Doc with the service account email (Editor role).")
@@ -561,7 +687,10 @@ with col_preview:
         st.caption("🟦 Cyan = calibration card  ·  🟢 Lime = leaf HSV mask")
 
         with st.spinner("Rendering preview…"):
-            preview_bytes, card_ok, leaf_ok = live_preview(img_bytes, hsv_lo, hsv_hi, card_thresh)
+            preview_bytes, card_ok, leaf_ok = live_preview(
+                img_bytes, hsv_lo, hsv_hi, card_thresh,
+                use_contour=use_contour, edge_thresh=edge_thresh,
+                contour_expand=contour_expand)
 
         # Side-by-side: colour overlay  |  binary leaf mask
         pv1, pv2 = st.columns(2)
@@ -570,7 +699,10 @@ with col_preview:
         with pv2:
             # Generate the raw binary leaf mask as a standalone image
             rgb_prev      = _load_rgb(img_bytes)
-            raw_leaf_mask = find_leaf_mask(rgb_prev, hsv_lo, hsv_hi)
+            raw_leaf_mask = find_leaf_mask(rgb_prev, hsv_lo, hsv_hi,
+                                              use_contour=use_contour,
+                                              edge_thresh=edge_thresh,
+                                              contour_expand=contour_expand)
             mask_vis      = np.where(raw_leaf_mask[..., None],
                                      np.array([80, 255, 80], dtype=np.uint8),
                                      np.array([20, 20, 20],  dtype=np.uint8))
@@ -592,7 +724,9 @@ with col_preview:
     # ── Measurement results ───────────────────────────────────────────────
     if run_btn and img_bytes:
         with st.spinner("Running CV pipeline…"):
-            result = process_image(img_bytes, card_size, hsv_lo, hsv_hi, card_thresh)
+            result = process_image(img_bytes, card_size, hsv_lo, hsv_hi, card_thresh,
+                                       use_contour=use_contour, edge_thresh=edge_thresh,
+                                       contour_expand=contour_expand)
 
         if "error" in result:
             st.markdown(f'<div class="warning-box">⚠️ {result["error"]}</div>', unsafe_allow_html=True)
