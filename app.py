@@ -384,7 +384,7 @@ PRESETS = {
 
 with st.sidebar:
     st.markdown('<div class="section-header">⚙️ CV Parameters</div>', unsafe_allow_html=True)
-    card_size   = st.number_input("Calibration card size (cm)", value=5.0, min_value=1.0, max_value=50.0, step=0.5)
+    card_size   = st.number_input("Calibration card size (cm)", value=2.0, min_value=0.5, max_value=50.0, step=0.5)
     card_thresh = st.slider("🟦 Card darkness threshold", 10, 120, 40,
                             help="Lower = only very dark pixels count as the card.")
 
@@ -431,7 +431,7 @@ st.markdown("""
   <span style="font-size:2.6rem">🌿</span>
   <div>
     <div class="hero-title">LeafDustLab · Area & Dust Density</div>
-    <div class="hero-sub">Upload a baseline leaf photo · measure area automatically · log dust density · export to Google Docs</div>
+    <div class="hero-sub">Use live camera or upload a photo · measure leaf area automatically · log dust density · export to Google Docs</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -455,29 +455,75 @@ with col_form:
     with wc2:
         w_post = st.number_input("W_post (g)", value=0.0, format="%.4f", help="Dusty leaf weight")
 
-    st.markdown('<div class="section-header">📷 Baseline Photo</div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("Upload leaf photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
-    run_btn  = st.button("🔬 Measure Leaf Area", use_container_width=True)
+    # ── Photo source: camera OR file upload ──────────────────────────────
+    st.markdown('<div class="section-header">📷 Photo Source</div>', unsafe_allow_html=True)
+    src_tab_cam, src_tab_upload = st.tabs(["📸 Live Camera", "🗂️ Upload File"])
 
-# ─── Right panel ─────────────────────────────────────────────────────────────
+    camera_bytes  = None
+    uploaded_file = None
+
+    with src_tab_cam:
+        st.caption("Point camera at leaf + calibration card. Use the **mask preview** on the right "
+                   "to tune sliders until leaf = lime and card = cyan, then click the shutter.")
+        cam_frame = st.camera_input("Take a photo", key="cam_input", label_visibility="collapsed")
+        if cam_frame is not None:
+            camera_bytes = cam_frame.getvalue()
+
+    with src_tab_upload:
+        uploaded_file = st.file_uploader("Upload leaf photo (JPG/PNG)",
+                                         type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+
+    # Resolve active image bytes (camera takes priority if both present)
+    img_bytes = None
+    if camera_bytes:
+        img_bytes = camera_bytes
+    elif uploaded_file:
+        img_bytes = uploaded_file.read()
+
+    run_btn = st.button("🔬 Measure Leaf Area", use_container_width=True,
+                        disabled=(img_bytes is None))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Right panel — live preview (always) + results (after Measure)
+# ═══════════════════════════════════════════════════════════════════════════════
 result = None
 with col_preview:
-    if uploaded:
-        img_bytes = uploaded.read()
+    if img_bytes:
+        # ── Live overlay preview ──────────────────────────────────────────
         st.markdown('<div class="section-header">👁️ Live Threshold Preview</div>', unsafe_allow_html=True)
-        st.caption("🟦 Cyan = calibration card  ·  🟢 Lime = leaf HSV mask  ·  Updates as you move sliders")
+        st.caption("🟦 Cyan = calibration card  ·  🟢 Lime = leaf HSV mask")
+
         with st.spinner("Rendering preview…"):
             preview_bytes, card_ok, leaf_ok = live_preview(img_bytes, hsv_lo, hsv_hi, card_thresh)
-        st.image(preview_bytes, use_container_width=True)
+
+        # Side-by-side: colour overlay  |  binary leaf mask
+        pv1, pv2 = st.columns(2)
+        with pv1:
+            st.image(preview_bytes, caption="Overlay", use_container_width=True)
+        with pv2:
+            # Generate the raw binary leaf mask as a standalone image
+            rgb_prev      = _load_rgb(img_bytes)
+            raw_leaf_mask = find_leaf_mask(rgb_prev, hsv_lo, hsv_hi)
+            mask_vis      = np.where(raw_leaf_mask[..., None],
+                                     np.array([80, 255, 80], dtype=np.uint8),
+                                     np.array([20, 20, 20],  dtype=np.uint8))
+            mask_buf = io.BytesIO()
+            Image.fromarray(mask_vis.astype(np.uint8)).save(mask_buf, format="JPEG", quality=85)
+            st.image(mask_buf.getvalue(), caption="Leaf mask", use_container_width=True)
+
         sc1, sc2 = st.columns(2)
         with sc1:
             if card_ok: st.success("✅ Card detected")
             else:        st.error("❌ Card not found — lower threshold")
         with sc2:
             if leaf_ok: st.success("✅ Leaf detected")
-            else:        st.warning("⚠️ No leaf — adjust HSV")
+            else:        st.warning("⚠️ No leaf — adjust HSV sliders")
 
-    if run_btn and uploaded:
+    elif not img_bytes:
+        st.info("👈 Take a photo with the camera or upload a file to see the live preview.")
+
+    # ── Measurement results ───────────────────────────────────────────────
+    if run_btn and img_bytes:
         with st.spinner("Running CV pipeline…"):
             result = process_image(img_bytes, card_size, hsv_lo, hsv_hi, card_thresh)
 
@@ -507,9 +553,10 @@ with col_preview:
 
             tab_orig, tab_mask, tab_json = st.tabs(["Original photo", "Leaf mask", "Full details"])
             with tab_orig:
-                st.image(img_bytes, caption="Stage A baseline (unmodified)", use_container_width=True)
+                st.image(img_bytes, caption="Captured photo (unmodified)", use_container_width=True)
             with tab_mask:
-                st.image(result["mask_bytes"], caption="Binary HSV mask (white = selected pixels)", use_container_width=True)
+                st.image(result["mask_bytes"], caption="Binary HSV mask (white = selected pixels)",
+                         use_container_width=True)
             with tab_json:
                 st.json({
                     "sample_no": sample_no, "leaf_name": leaf_name, "species": species,
@@ -532,9 +579,6 @@ with col_preview:
             st.session_state.log.append(log_entry)
             st.markdown('<div class="success-box">✅ Logged! Scroll down to view the session log.</div>',
                         unsafe_allow_html=True)
-
-    elif run_btn and not uploaded:
-        st.markdown('<div class="warning-box">⚠️ Please upload a leaf photo first.</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Session Log
