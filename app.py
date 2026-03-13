@@ -630,203 +630,364 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Main layout
+#  Top-level tabs
 # ═══════════════════════════════════════════════════════════════════════════════
-col_form, col_preview = st.columns([1, 1.4], gap="large")
+tab_tune, tab_measure, tab_log = st.tabs(["🎛️ Live Tune", "🔬 Measure", "📊 Session Log"])
 
-with col_form:
-    st.markdown('<div class="section-header">📋 Sample Details</div>', unsafe_allow_html=True)
-    sample_no = st.text_input("Sample No.",                    placeholder="e.g. 001")
-    leaf_name = st.text_input("Leaf / Specimen Name",          placeholder="e.g. Leaf-A")
-    species   = st.text_input("Species (scientific / common)", placeholder="e.g. Ficus benghalensis")
-    notes     = st.text_area("Notes",                          placeholder="Collection site, height, condition…", height=80)
+# ───────────────────────────────────────────────────────────────────────────────
+#  TAB 1 ─ Live Tune
+#  Workflow:
+#    1. Point camera at leaf
+#    2. Click "Freeze frame" → bytes saved to session_state["tune_frame"]
+#    3. Drag sidebar sliders → Streamlit reruns → overlay re-renders from frozen frame
+#    4. When happy, click "➡ Send to Measure tab"
+# ───────────────────────────────────────────────────────────────────────────────
+with tab_tune:
+    st.markdown(
+        "<p style='color:#88aa88;margin:0 0 18px 0'>"
+        "<b>How to use:</b> point the camera at your leaf + calibration card, "
+        "click <b>Freeze frame ❄️</b>, then drag the sidebar sliders — "
+        "the overlay updates instantly on every drag so you can dial in the "
+        "perfect thresholds before measuring.</p>",
+        unsafe_allow_html=True,
+    )
 
-    st.markdown('<div class="section-header">⚖️ Weighing Data</div>', unsafe_allow_html=True)
-    wc1, wc2 = st.columns(2)
-    with wc1:
-        w_pre  = st.number_input("W_pre (g)",  value=0.0, format="%.4f", help="Clean leaf weight")
-    with wc2:
-        w_post = st.number_input("W_post (g)", value=0.0, format="%.4f", help="Dusty leaf weight")
+    tune_cam_col, tune_overlay_col = st.columns([1, 1.55], gap="large")
 
-    # ── Photo source: camera OR file upload ──────────────────────────────
-    st.markdown('<div class="section-header">📷 Photo Source</div>', unsafe_allow_html=True)
-    src_tab_cam, src_tab_upload = st.tabs(["📸 Live Camera", "🗂️ Upload File"])
+    # ── Left: camera + freeze controls ───────────────────────────────────
+    with tune_cam_col:
+        st.markdown('<div class="section-header">📸 Camera</div>', unsafe_allow_html=True)
 
-    camera_bytes  = None
-    uploaded_file = None
+        tune_cam = st.camera_input("Live camera feed", key="tune_cam",
+                                   label_visibility="collapsed")
 
-    with src_tab_cam:
-        st.caption("Point camera at leaf + calibration card. Use the **mask preview** on the right "
-                   "to tune sliders until leaf = lime and card = cyan, then click the shutter.")
-        cam_frame = st.camera_input("Take a photo", key="cam_input", label_visibility="collapsed")
-        if cam_frame is not None:
-            camera_bytes = cam_frame.getvalue()
+        # Always persist the latest capture so slider drags don't reset it
+        if tune_cam is not None:
+            st.session_state["tune_frame"] = tune_cam.getvalue()
 
-    with src_tab_upload:
-        uploaded_file = st.file_uploader("Upload leaf photo (JPG/PNG)",
-                                         type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+        has_frame = "tune_frame" in st.session_state
 
-    # Resolve active image bytes (camera takes priority if both present)
-    img_bytes = None
-    if camera_bytes:
-        img_bytes = camera_bytes
-    elif uploaded_file:
-        img_bytes = uploaded_file.read()
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            freeze_clicked = st.button("❄️ Freeze frame", use_container_width=True,
+                                       disabled=(tune_cam is None),
+                                       help="Lock this capture so slider drags update the overlay without resetting the camera")
+        with btn_col2:
+            clear_clicked = st.button("🗑️ Clear frame", use_container_width=True,
+                                      disabled=not has_frame)
 
-    run_btn = st.button("🔬 Measure Leaf Area", use_container_width=True,
-                        disabled=(img_bytes is None))
+        if freeze_clicked and tune_cam is not None:
+            st.session_state["tune_frame"] = tune_cam.getvalue()
+            st.success("❄️ Frame frozen — now drag any sidebar slider!")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Right panel — live preview (always) + results (after Measure)
-# ═══════════════════════════════════════════════════════════════════════════════
-result = None
-with col_preview:
-    if img_bytes:
-        # ── Live overlay preview ──────────────────────────────────────────
-        st.markdown('<div class="section-header">👁️ Live Threshold Preview</div>', unsafe_allow_html=True)
-        st.caption("🟦 Cyan = calibration card  ·  🟢 Lime = leaf HSV mask")
+        if clear_clicked and has_frame:
+            del st.session_state["tune_frame"]
+            st.rerun()
 
-        with st.spinner("Rendering preview…"):
-            preview_bytes, card_ok, leaf_ok = live_preview(
-                img_bytes, hsv_lo, hsv_hi, card_thresh,
-                use_contour=use_contour, edge_thresh=edge_thresh,
-                contour_expand=contour_expand)
+        # Status
+        if has_frame:
+            st.markdown(
+                '<div class="success-box" style="margin-top:10px">'
+                '✅ Frame locked. Move any sidebar slider → overlay updates in real time.</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div class="warning-box" style="margin-top:10px">'
+                '📷 Snap a photo above to begin tuning.</div>',
+                unsafe_allow_html=True)
 
-        # Side-by-side: colour overlay  |  binary leaf mask
-        pv1, pv2 = st.columns(2)
-        with pv1:
-            st.image(preview_bytes, caption="Overlay", use_container_width=True)
-        with pv2:
-            # Generate the raw binary leaf mask as a standalone image
-            rgb_prev      = _load_rgb(img_bytes)
-            raw_leaf_mask = find_leaf_mask(rgb_prev, hsv_lo, hsv_hi,
-                                              use_contour=use_contour,
-                                              edge_thresh=edge_thresh,
-                                              contour_expand=contour_expand)
-            mask_vis      = np.where(raw_leaf_mask[..., None],
+        # Current parameter badge strip
+        st.markdown('<div class="section-header" style="margin-top:18px">🎚️ Active parameters</div>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            f'<span class="hsv-badge">H {hsv_lo[0]}–{hsv_hi[0]}</span>'
+            f'<span class="hsv-badge">S {hsv_lo[1]}–{hsv_hi[1]}</span>'
+            f'<span class="hsv-badge">V {hsv_lo[2]}–{hsv_hi[2]}</span>'
+            f'<span class="hsv-badge">Card thr {card_thresh}</span>'
+            + (f'<span class="hsv-badge">Edge {edge_thresh}</span>'
+               f'<span class="hsv-badge">Expand {contour_expand}px</span>' if use_contour else ''),
+            unsafe_allow_html=True,
+        )
+
+        # Transfer to Measure tab
+        st.markdown("")
+        if has_frame:
+            if st.button("➡️ Send to Measure tab", use_container_width=True,
+                         help="Copies this frame so the Measure tab uses it directly"):
+                st.session_state["measure_frame"] = st.session_state["tune_frame"]
+                st.success("Sent! Switch to the 🔬 Measure tab.")
+
+    # ── Right: live overlay + mask — re-renders on every slider drag ──────
+    with tune_overlay_col:
+        st.markdown('<div class="section-header">👁️ Live Overlay & Mask</div>',
+                    unsafe_allow_html=True)
+        st.caption("🟦 Cyan = card · 🟢 Lime fill = leaf  |  drag any sidebar slider to update")
+
+        # Use the frozen frame if available, else fall back to the just-snapped frame
+        tune_frame_bytes = st.session_state.get("tune_frame") or \
+                           (tune_cam.getvalue() if tune_cam else None)
+
+        if tune_frame_bytes:
+            with st.spinner("Rendering…"):
+                tune_prev_bytes, t_card_ok, t_leaf_ok = live_preview(
+                    tune_frame_bytes, hsv_lo, hsv_hi, card_thresh,
+                    use_contour=use_contour,
+                    edge_thresh=edge_thresh,
+                    contour_expand=contour_expand,
+                )
+                # Build binary mask image
+                rgb_t  = _load_rgb(tune_frame_bytes)
+                mask_t = find_leaf_mask(rgb_t, hsv_lo, hsv_hi,
+                                        use_contour=use_contour,
+                                        edge_thresh=edge_thresh,
+                                        contour_expand=contour_expand)
+                mask_vis_t = np.where(mask_t[..., None],
+                                      np.array([80, 255, 80],  dtype=np.uint8),
+                                      np.array([15, 15, 15], dtype=np.uint8))
+                mbuf = io.BytesIO()
+                Image.fromarray(mask_vis_t.astype(np.uint8)).save(mbuf, "JPEG", quality=85)
+
+            ov_col, mk_col = st.columns(2)
+            with ov_col:
+                st.image(tune_prev_bytes, caption="Colour overlay", use_container_width=True)
+            with mk_col:
+                st.image(mbuf.getvalue(), caption="Leaf mask (green = selected)",
+                         use_container_width=True)
+
+            # Detection badges
+            db1, db2 = st.columns(2)
+            with db1:
+                if t_card_ok: st.success("✅ Card detected")
+                else:          st.error("❌ Card not found")
+            with db2:
+                if t_leaf_ok: st.success("✅ Leaf detected")
+                else:          st.warning("⚠️ No leaf — adjust HSV")
+
+            # Live coverage % — useful sanity check
+            if t_leaf_ok:
+                h_t, w_t = rgb_t.shape[:2]
+                cov = mask_t.sum() / (h_t * w_t) * 100
+                st.markdown(
+                    f'<div class="metric-card" style="margin-top:12px">'
+                    f'<div class="metric-value">{cov:.1f}%</div>'
+                    f'<div class="metric-label">leaf pixel coverage of frame</div></div>',
+                    unsafe_allow_html=True)
+        else:
+            st.info("📷 Snap a photo on the left — the overlay will appear here.")
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  TAB 2 ─ Measure
+# ───────────────────────────────────────────────────────────────────────────────
+with tab_measure:
+    col_form, col_preview = st.columns([1, 1.4], gap="large")
+
+    with col_form:
+        st.markdown('<div class="section-header">📋 Sample Details</div>', unsafe_allow_html=True)
+        sample_no = st.text_input("Sample No.",                    placeholder="e.g. 001")
+        leaf_name = st.text_input("Leaf / Specimen Name",          placeholder="e.g. Leaf-A")
+        species   = st.text_input("Species (scientific / common)", placeholder="e.g. Ficus benghalensis")
+        notes     = st.text_area("Notes",                          placeholder="Collection site, height, condition…", height=80)
+
+        st.markdown('<div class="section-header">⚖️ Weighing Data</div>', unsafe_allow_html=True)
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            w_pre  = st.number_input("W_pre (g)",  value=0.0, format="%.4f", help="Clean leaf weight")
+        with wc2:
+            w_post = st.number_input("W_post (g)", value=0.0, format="%.4f", help="Dusty leaf weight")
+
+        st.markdown('<div class="section-header">📷 Photo Source</div>', unsafe_allow_html=True)
+
+        # Show if a frame was transferred from Live Tune
+        transferred = "measure_frame" in st.session_state
+        if transferred:
+            st.markdown(
+                '<div class="success-box">✅ Using frame transferred from 🎛️ Live Tune tab.</div>',
+                unsafe_allow_html=True)
+            if st.button("✖ Discard & use new photo", use_container_width=False):
+                del st.session_state["measure_frame"]
+                st.rerun()
+
+        src_tab_cam, src_tab_upload = st.tabs(["📸 Camera", "🗂️ Upload File"])
+        camera_bytes  = None
+        uploaded_file = None
+
+        with src_tab_cam:
+            st.caption("Snap a photo, or use a frame already transferred from Live Tune.")
+            meas_cam = st.camera_input("Take a photo", key="meas_cam",
+                                       label_visibility="collapsed")
+            if meas_cam is not None:
+                camera_bytes = meas_cam.getvalue()
+
+        with src_tab_upload:
+            uploaded_file = st.file_uploader("Upload leaf photo (JPG/PNG)",
+                                             type=["jpg", "jpeg", "png"],
+                                             label_visibility="collapsed")
+
+        # Priority: fresh camera snap > transferred tune frame > upload
+        img_bytes = None
+        if camera_bytes:
+            img_bytes = camera_bytes
+        elif transferred:
+            img_bytes = st.session_state["measure_frame"]
+        elif uploaded_file:
+            img_bytes = uploaded_file.read()
+
+        run_btn = st.button("🔬 Measure Leaf Area", use_container_width=True,
+                            disabled=(img_bytes is None))
+
+    # ── Right: preview + results ──────────────────────────────────────────
+    result = None
+    with col_preview:
+        if img_bytes:
+            st.markdown('<div class="section-header">👁️ Preview</div>', unsafe_allow_html=True)
+            st.caption("🟦 Cyan = card · 🟢 Lime = leaf — updates with sidebar sliders")
+
+            with st.spinner("Rendering preview…"):
+                preview_bytes, card_ok, leaf_ok = live_preview(
+                    img_bytes, hsv_lo, hsv_hi, card_thresh,
+                    use_contour=use_contour, edge_thresh=edge_thresh,
+                    contour_expand=contour_expand)
+
+            pv1, pv2 = st.columns(2)
+            with pv1:
+                st.image(preview_bytes, caption="Overlay", use_container_width=True)
+            with pv2:
+                rgb_prev  = _load_rgb(img_bytes)
+                leaf_mask = find_leaf_mask(rgb_prev, hsv_lo, hsv_hi,
+                                           use_contour=use_contour,
+                                           edge_thresh=edge_thresh,
+                                           contour_expand=contour_expand)
+                mask_vis  = np.where(leaf_mask[..., None],
                                      np.array([80, 255, 80], dtype=np.uint8),
                                      np.array([20, 20, 20],  dtype=np.uint8))
-            mask_buf = io.BytesIO()
-            Image.fromarray(mask_vis.astype(np.uint8)).save(mask_buf, format="JPEG", quality=85)
-            st.image(mask_buf.getvalue(), caption="Leaf mask", use_container_width=True)
+                mask_buf  = io.BytesIO()
+                Image.fromarray(mask_vis.astype(np.uint8)).save(mask_buf, "JPEG", quality=85)
+                st.image(mask_buf.getvalue(), caption="Leaf mask", use_container_width=True)
 
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            if card_ok: st.success("✅ Card detected")
-            else:        st.error("❌ Card not found — lower threshold")
-        with sc2:
-            if leaf_ok: st.success("✅ Leaf detected")
-            else:        st.warning("⚠️ No leaf — adjust HSV sliders")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if card_ok: st.success("✅ Card detected")
+                else:        st.error("❌ Card not found — lower threshold")
+            with sc2:
+                if leaf_ok: st.success("✅ Leaf detected")
+                else:        st.warning("⚠️ No leaf — adjust HSV")
+        else:
+            st.info("👈 Snap a photo, transfer from Live Tune, or upload a file.")
 
-    elif not img_bytes:
-        st.info("👈 Take a photo with the camera or upload a file to see the live preview.")
-
-    # ── Measurement results ───────────────────────────────────────────────
-    if run_btn and img_bytes:
-        with st.spinner("Running CV pipeline…"):
-            result = process_image(img_bytes, card_size, hsv_lo, hsv_hi, card_thresh,
+        if run_btn and img_bytes:
+            with st.spinner("Running CV pipeline…"):
+                result = process_image(img_bytes, card_size, hsv_lo, hsv_hi, card_thresh,
                                        use_contour=use_contour, edge_thresh=edge_thresh,
                                        contour_expand=contour_expand)
 
-        if "error" in result:
-            st.markdown(f'<div class="warning-box">⚠️ {result["error"]}</div>', unsafe_allow_html=True)
-        else:
-            dust_g       = w_post - w_pre
-            dust_density = round((dust_g * 1000) / result["leaf_area_cm2"], 4) \
-                           if result["leaf_area_cm2"] > 0 else 0.0
+            if "error" in result:
+                st.markdown(f'<div class="warning-box">⚠️ {result["error"]}</div>',
+                            unsafe_allow_html=True)
+            else:
+                dust_g       = w_post - w_pre
+                dust_density = round((dust_g * 1000) / result["leaf_area_cm2"], 4) \
+                               if result["leaf_area_cm2"] > 0 else 0.0
 
-            st.markdown('<div class="section-header">✅ Results</div>', unsafe_allow_html=True)
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{result["leaf_area_cm2"]}</div>'
-                            f'<div class="metric-label">cm² leaf area</div></div>', unsafe_allow_html=True)
-            with m2:
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{result["px_per_cm"]}</div>'
-                            f'<div class="metric-label">px / cm</div></div>', unsafe_allow_html=True)
-            with m3:
-                dd_disp = f"{dust_density:.4f}" if (w_post > 0 and w_pre > 0) else "—"
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{dd_disp}</div>'
-                            f'<div class="metric-label">mg/cm² dust</div></div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-header">✅ Results</div>', unsafe_allow_html=True)
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.markdown(f'<div class="metric-card"><div class="metric-value">{result["leaf_area_cm2"]}</div>'
+                                f'<div class="metric-label">cm² leaf area</div></div>',
+                                unsafe_allow_html=True)
+                with m2:
+                    st.markdown(f'<div class="metric-card"><div class="metric-value">{result["px_per_cm"]}</div>'
+                                f'<div class="metric-label">px / cm</div></div>',
+                                unsafe_allow_html=True)
+                with m3:
+                    dd_disp = f"{dust_density:.4f}" if (w_post > 0 and w_pre > 0) else "—"
+                    st.markdown(f'<div class="metric-card"><div class="metric-value">{dd_disp}</div>'
+                                f'<div class="metric-label">mg/cm² dust</div></div>',
+                                unsafe_allow_html=True)
 
-            st.markdown('<div class="section-header">🖼️ Annotated Output</div>', unsafe_allow_html=True)
-            st.caption("🟡 Yellow box = calibration card  ·  🟢 Green outline = measured leaf")
-            st.image(result["annotated_bytes"], use_container_width=True)
+                st.markdown('<div class="section-header">🖼️ Annotated Output</div>',
+                            unsafe_allow_html=True)
+                st.caption("🟡 Yellow box = calibration card  ·  🟢 Green outline = measured leaf")
+                st.image(result["annotated_bytes"], use_container_width=True)
 
-            tab_orig, tab_mask, tab_json = st.tabs(["Original photo", "Leaf mask", "Full details"])
-            with tab_orig:
-                st.image(img_bytes, caption="Captured photo (unmodified)", use_container_width=True)
-            with tab_mask:
-                st.image(result["mask_bytes"], caption="Binary HSV mask (white = selected pixels)",
-                         use_container_width=True)
-            with tab_json:
-                st.json({
+                tab_orig, tab_mask, tab_json = st.tabs(["Original photo", "Leaf mask", "Full details"])
+                with tab_orig:
+                    st.image(img_bytes, caption="Captured photo (unmodified)",
+                             use_container_width=True)
+                with tab_mask:
+                    st.image(result["mask_bytes"],
+                             caption="Binary HSV mask (white = selected pixels)",
+                             use_container_width=True)
+                with tab_json:
+                    st.json({
+                        "sample_no": sample_no, "leaf_name": leaf_name, "species": species,
+                        "leaf_area_cm2": result["leaf_area_cm2"],
+                        "px_per_cm": result["px_per_cm"], "leaf_px": result["leaf_px"],
+                        "w_pre_g": w_pre, "w_post_g": w_post,
+                        "dust_density_mg_cm2": dust_density if w_post > 0 else None,
+                    })
+
+                log_entry = {
                     "sample_no": sample_no, "leaf_name": leaf_name, "species": species,
                     "leaf_area_cm2": result["leaf_area_cm2"],
-                    "px_per_cm": result["px_per_cm"], "leaf_px": result["leaf_px"],
-                    "w_pre_g": w_pre, "w_post_g": w_post,
-                    "dust_density_mg_cm2": dust_density if w_post > 0 else None,
-                })
+                    "w_pre": w_pre, "w_post": w_post,
+                    "dust_density": dust_density if w_post > 0 else None,
+                    "notes": notes,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "annotated_bytes": result["annotated_bytes"],
+                }
+                st.session_state.log = [r for r in st.session_state.log
+                                        if r["sample_no"] != sample_no]
+                st.session_state.log.append(log_entry)
+                st.markdown(
+                    '<div class="success-box">✅ Logged! Switch to the 📊 Session Log tab.</div>',
+                    unsafe_allow_html=True)
 
-            log_entry = {
-                "sample_no": sample_no, "leaf_name": leaf_name, "species": species,
-                "leaf_area_cm2": result["leaf_area_cm2"],
-                "w_pre": w_pre, "w_post": w_post,
-                "dust_density": dust_density if w_post > 0 else None,
-                "notes": notes,
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "annotated_bytes": result["annotated_bytes"],
-            }
-            st.session_state.log = [r for r in st.session_state.log if r["sample_no"] != sample_no]
-            st.session_state.log.append(log_entry)
-            st.markdown('<div class="success-box">✅ Logged! Scroll down to view the session log.</div>',
-                        unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Session Log
-# ═══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-st.markdown('<div class="section-header">📊 Session Log</div>', unsafe_allow_html=True)
+# ───────────────────────────────────────────────────────────────────────────────
+#  TAB 3 ─ Session Log
+# ───────────────────────────────────────────────────────────────────────────────
+with tab_log:
+    if not st.session_state.log:
+        st.info("No measurements yet. Run a measurement in the 🔬 Measure tab to start logging.")
+    else:
+        rows_html = ""
+        for r in st.session_state.log:
+            dd = f"{r['dust_density']:.4f}" if r["dust_density"] is not None else "—"
+            rows_html += (
+                f"<tr><td>{r['sample_no']}</td><td>{r['leaf_name']}</td><td>{r['species']}</td>"
+                f"<td>{r['leaf_area_cm2']} cm²</td><td>{r['w_pre']} g</td><td>{r['w_post']} g</td>"
+                f"<td>{dd} mg/cm²</td><td>{r['timestamp']}</td></tr>"
+            )
+        st.markdown(f"""
+        <table class="log-table">
+          <thead><tr>
+            <th>Sample</th><th>Name</th><th>Species</th>
+            <th>Area</th><th>W pre</th><th>W post</th><th>Dust density</th><th>Timestamp</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>""", unsafe_allow_html=True)
 
-if not st.session_state.log:
-    st.info("No measurements yet. Process a leaf photo to start logging.")
-else:
-    rows_html = ""
-    for r in st.session_state.log:
-        dd = f"{r['dust_density']:.4f}" if r["dust_density"] is not None else "—"
-        rows_html += (
-            f"<tr><td>{r['sample_no']}</td><td>{r['leaf_name']}</td><td>{r['species']}</td>"
-            f"<td>{r['leaf_area_cm2']} cm²</td><td>{r['w_pre']} g</td><td>{r['w_post']} g</td>"
-            f"<td>{dd} mg/cm²</td><td>{r['timestamp']}</td></tr>"
-        )
-    st.markdown(f"""
-    <table class="log-table">
-      <thead><tr>
-        <th>Sample</th><th>Name</th><th>Species</th>
-        <th>Area</th><th>W pre</th><th>W post</th><th>Dust density</th><th>Timestamp</th>
-      </tr></thead>
-      <tbody>{rows_html}</tbody>
-    </table>""", unsafe_allow_html=True)
-
-    st.markdown("")
-    gc1, gc2 = st.columns([1, 2])
-    with gc1:
-        if st.button("🗑️ Clear Log", use_container_width=True):
-            st.session_state.log = []
-            st.rerun()
-    with gc2:
-        if st.button("📤 Export All to Google Docs", use_container_width=True):
-            if not gdoc_id or not sa_json:
-                st.error("Fill in the Google Doc ID and Service Account JSON in the sidebar first.")
-            else:
-                with st.spinner("Uploading to Google Docs…"):
-                    try:
-                        url = export_to_gdoc(st.session_state.log, sa_json, gdoc_id)
-                        st.markdown(
-                            f'<div class="success-box">✅ Exported! '
-                            f'<a href="{url}" target="_blank">Open Google Doc →</a></div>',
-                            unsafe_allow_html=True)
-                    except Exception as e:
-                        st.error(f"Export failed: {e}")
+        st.markdown("")
+        gc1, gc2 = st.columns([1, 2])
+        with gc1:
+            if st.button("🗑️ Clear Log", use_container_width=True):
+                st.session_state.log = []
+                st.rerun()
+        with gc2:
+            if st.button("📤 Export All to Google Docs", use_container_width=True):
+                if not gdoc_id or not sa_json:
+                    st.error("Fill in the Google Doc ID and Service Account JSON in the sidebar first.")
+                else:
+                    with st.spinner("Uploading to Google Docs…"):
+                        try:
+                            url = export_to_gdoc(st.session_state.log, sa_json, gdoc_id)
+                            st.markdown(
+                                f'<div class="success-box">✅ Exported! '
+                                f'<a href="{url}" target="_blank">Open Google Doc →</a></div>',
+                                unsafe_allow_html=True)
+                        except Exception as e:
+                            st.error(f"Export failed: {e}")
 
 st.markdown("---")
 st.markdown('<p style="text-align:center;color:#444;font-size:0.8rem;">'
