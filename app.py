@@ -125,29 +125,93 @@ def _morph(mask: np.ndarray, radius: int = 7) -> np.ndarray:
     return mask.astype(bool)
 
 def _largest_dark_rect(gray: np.ndarray, thresh: int):
-    """Bounding rect of largest dark-pixel blob. Returns (avg_side, (x,y,w,h)) or (None, None)."""
-    dark = gray < thresh
+    """
+    Find the calibration card among all dark blobs.
+
+    Strategy: label every dark blob, then score each one on three criteria
+    and pick the best scorer — not just the biggest blob.
+
+    Scoring per blob:
+      squareness  — aspect ratio penalty: 1.0 when w==h, drops toward 0 as it gets elongated
+      solidity    — filled_pixels / bounding_box_pixels: a solid square card scores ~1.0;
+                    a shadow/border/thin strip scores much lower
+      size_fit    — prefer blobs that are 1%–25% of the image area (card is never the
+                    whole frame, never a tiny speck)
+
+    Combined score = squareness * solidity * size_fit
+    The blob with the highest combined score is taken as the card.
+    """
+    from scipy.ndimage import label as sp_label
+
+    dark   = gray < thresh
+    img_px = gray.size        # total pixel count for relative-size check
+
     try:
-        from scipy.ndimage import label as sp_label
         labeled, n = sp_label(dark)
-        if n == 0:
-            return None, None
-        sizes = np.bincount(labeled.ravel()); sizes[0] = 0
-        lbl = sizes.argmax()
-        region = labeled == lbl
-        rows = np.where(np.any(region, axis=1))[0]
-        cols = np.where(np.any(region, axis=0))[0]
-        y0, y1, x0, x1 = rows[0], rows[-1], cols[0], cols[-1]
-    except ImportError:
+    except Exception:
+        # scipy unavailable — crude whole-mask bbox fallback
         rows = np.where(np.any(dark, axis=1))[0]
         cols = np.where(np.any(dark, axis=0))[0]
         if len(rows) == 0:
             return None, None
         y0, y1, x0, x1 = rows[0], rows[-1], cols[0], cols[-1]
-    w, h = int(x1 - x0), int(y1 - y0)
-    if w < 5 or h < 5:
+        w, h = int(x1-x0), int(y1-y0)
+        return (w+h)/2.0, (int(x0), int(y0), w, h)
+
+    if n == 0:
         return None, None
-    return (w + h) / 2.0, (int(x0), int(y0), w, h)
+
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0   # ignore background label
+
+    best_score = -1.0
+    best_rect  = None
+
+    for lbl in range(1, n + 1):
+        blob_area = int(sizes[lbl])
+        if blob_area < 30:          # skip tiny noise specks
+            continue
+
+        region = labeled == lbl
+        rows   = np.where(np.any(region, axis=1))[0]
+        cols   = np.where(np.any(region, axis=0))[0]
+        if len(rows) < 2 or len(cols) < 2:
+            continue
+
+        y0, y1 = rows[0], rows[-1]
+        x0, x1 = cols[0], cols[-1]
+        bw = int(x1 - x0) or 1
+        bh = int(y1 - y0) or 1
+        bbox_area = bw * bh
+
+        # ── squareness: 1.0 = perfect square, 0 = very elongated ────────
+        aspect     = min(bw, bh) / max(bw, bh)       # 0..1
+        squareness = aspect ** 2                       # penalise harder
+
+        # ── solidity: filled pixels / bounding box pixels ───────────────
+        solidity = blob_area / bbox_area               # 0..1
+
+        # ── size_fit: card should be 0.5%–30% of frame ──────────────────
+        rel = blob_area / img_px
+        if rel < 0.005 or rel > 0.30:
+            size_fit = 0.0                             # disqualify extremes
+        else:
+            # Peak around 5% of frame; gentle penalty away from peak
+            size_fit = 1.0 - abs(rel - 0.05) / 0.25
+            size_fit = max(0.0, size_fit)
+
+        score = squareness * solidity * size_fit
+
+        if score > best_score:
+            best_score = score
+            best_rect  = (int(x0), int(y0), bw, bh)
+
+    if best_rect is None or best_score < 0.05:
+        return None, None
+
+    x, y, w, h = best_rect
+    return (w + h) / 2.0, best_rect
+
 
 def _largest_blob(mask: np.ndarray):
     """Area, bounding rect, centroid of largest True blob. Returns (area, rect, centroid) or Nones."""
@@ -387,6 +451,9 @@ with st.sidebar:
     card_size   = st.number_input("Calibration card size (cm)", value=2.0, min_value=0.5, max_value=50.0, step=0.5)
     card_thresh = st.slider("🟦 Card darkness threshold", 10, 120, 40,
                             help="Lower = only very dark pixels count as the card.")
+    st.caption("💡 **Card tip:** The detector picks the darkest blob that is most square "
+               "and solid. Avoid other dark square objects in frame. A white background "
+               "works best — the card will stand out clearly.")
 
     st.markdown('<div class="section-header">🎨 Leaf HSV Thresholds</div>', unsafe_allow_html=True)
     prev_preset = st.session_state.get("_prev_preset")
